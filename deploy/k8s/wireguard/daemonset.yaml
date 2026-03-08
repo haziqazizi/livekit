@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: wireguard
+  labels:
+    app: wireguard
+spec:
+  selector:
+    matchLabels:
+      app: wireguard
+  template:
+    metadata:
+      labels:
+        app: wireguard
+    spec:
+      hostNetwork: true
+      initContainers:
+        - name: build-tools
+          image: golang:1.22-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache git make gcc musl-dev linux-headers openssl-dev tar curl >/dev/null 2>&1
+
+              # Build wireguard-go
+              cd /tmp
+              git clone --depth 1 https://github.com/WireGuard/wireguard-go.git 2>/dev/null
+              cd wireguard-go
+              make >/dev/null 2>&1
+              cp wireguard-go /shared/wireguard-go
+
+              # Build redis-cli with TLS support (Alpine's package lacks TLS)
+              cd /tmp
+              curl -sL https://download.redis.io/redis-stable.tar.gz | tar xz
+              cd redis-stable
+              make BUILD_TLS=yes MALLOC=libc redis-cli >/dev/null 2>&1
+              cp src/redis-cli /shared/redis-cli
+          volumeMounts:
+            - name: shared-bin
+              mountPath: /shared
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+      containers:
+        - name: wireguard
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache wireguard-tools jq curl bash openssl >/dev/null 2>&1
+              cp /shared/wireguard-go /usr/local/bin/wireguard-go
+              cp /shared/redis-cli /usr/local/bin/redis-cli
+              chmod +x /usr/local/bin/wireguard-go /usr/local/bin/redis-cli
+              export WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1
+              exec bash /scripts/peer-discovery.sh
+          env:
+            - name: WG_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: wireguard-region
+                  key: region
+            - name: WG_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wireguard-keys
+                  key: private-key
+            - name: VALKEY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: wireguard-keys
+                  key: valkey-url
+            - name: WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD
+              value: "1"
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+          volumeMounts:
+            - name: peer-discovery-script
+              mountPath: /scripts
+            - name: shared-bin
+              mountPath: /shared
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: peer-discovery-script
+          configMap:
+            name: wireguard-peer-discovery
+            defaultMode: 0755
+        - name: shared-bin
+          emptyDir: {}
+      tolerations:
+        - operator: Exists

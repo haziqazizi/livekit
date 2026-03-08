@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wireguard-peer-discovery
+  labels:
+    app: wireguard
+data:
+  peer-discovery.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    : "${WG_REGION:?WG_REGION is required}"
+    : "${WG_PRIVATE_KEY:?WG_PRIVATE_KEY is required}"
+    : "${VALKEY_URL:?VALKEY_URL is required}"
+
+    WG_INTERFACE="wg0"
+    WG_PORT=51820
+    WG_CONF="/tmp/${WG_INTERFACE}.conf"
+    HOSTNAME="$(hostname)"
+    REFRESH_INTERVAL=30
+
+    get_public_ip() {
+      local ip
+      ip=$(curl -s --max-time 5 https://ifconfig.me || curl -s --max-time 5 https://api.ipify.org || true)
+      if [[ -z "$ip" ]]; then
+        echo >&2 "ERROR: failed to detect public IP"
+        exit 1
+      fi
+      echo "$ip"
+    }
+
+    get_wg_public_key() {
+      echo "$WG_PRIVATE_KEY" | wg pubkey
+    }
+
+    allocate_tunnel_ip() {
+      local hash
+      hash=$(echo -n "${WG_REGION}:${HOSTNAME}" | md5sum | cut -c1-4)
+      local octet3=$(( 16#${hash:0:2} ))
+      local octet4=$(( 16#${hash:2:2} ))
+      octet4=$(( octet4 % 253 + 1 ))
+      echo "10.100.${octet3}.${octet4}"
+    }
+
+    valkey_cmd() {
+      redis-cli -u "$VALKEY_URL" "$@"
+    }
+
+    register_self() {
+      local public_ip="$1"
+      local public_key="$2"
+      local tunnel_ip="$3"
+      local key="wg:peers:${WG_REGION}:${HOSTNAME}"
+      local payload="{\"public_key\":\"${public_key}\",\"endpoint\":\"${public_ip}:${WG_PORT}\",\"allowed_ips\":\"${tunnel_ip}/32\",\"region\":\"${WG_REGION}\",\"hostname\":\"${HOSTNAME}\"}"
+      valkey_cmd SET "$key" "$payload" EX 120 >/dev/null
+    }
+
+    discover_peers() {
+      local keys
+      keys=$(valkey_cmd KEYS "wg:peers:*" | sort)
+      local self_key="wg:peers:${WG_REGION}:${HOSTNAME}"
+      local peers=""
+
+      while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        [[ "$key" == "$self_key" ]] && continue
+
+        local data
+        data=$(valkey_cmd GET "$key")
+        [[ -z "$data" ]] && continue
+
+        local pub_key endpoint allowed_ips
+        pub_key=$(echo "$data" | jq -r '.public_key')
+        endpoint=$(echo "$data" | jq -r '.endpoint')
+        allowed_ips=$(echo "$data" | jq -r '.allowed_ips')
+
+        peers+="
+    [Peer]
+    PublicKey = ${pub_key}
+    Endpoint = ${endpoint}
+    AllowedIPs = ${allowed_ips}
+    PersistentKeepalive = 25
+    "
+      done <<< "$keys"
+
+      echo "$peers"
+    }
+
+    generate_config() {
+      local tunnel_ip="$1"
+      local peers="$2"
+
+      cat > "$WG_CONF" <<CONF
+    [Interface]
+    PrivateKey = ${WG_PRIVATE_KEY}
+    ListenPort = ${WG_PORT}
+    ${peers}
+    CONF
+    }
+
+    apply_config() {
+      local tunnel_ip="$1"
+
+      if wg show "$WG_INTERFACE" >/dev/null 2>&1; then
+        wg syncconf "$WG_INTERFACE" <(grep -v "^\[Interface\]" "$WG_CONF" | grep -v "^PrivateKey" | grep -v "^ListenPort" | grep -v "^$")
+        echo "$(date -Iseconds) synced config for ${WG_INTERFACE}"
+      else
+        ip link del "$WG_INTERFACE" 2>/dev/null || true
+        wireguard-go "$WG_INTERFACE"
+        wg setconf "$WG_INTERFACE" "$WG_CONF"
+        ip addr add "${tunnel_ip}/16" dev "$WG_INTERFACE"
+        ip link set "$WG_INTERFACE" up
+        echo "$(date -Iseconds) brought up ${WG_INTERFACE} (userspace)"
+      fi
+    }
+
+    main() {
+      local public_ip public_key tunnel_ip
+      public_ip=$(get_public_ip)
+      public_key=$(get_wg_public_key)
+      tunnel_ip=$(allocate_tunnel_ip)
+
+      echo "region=${WG_REGION} host=${HOSTNAME} public_ip=${public_ip} tunnel_ip=${tunnel_ip}"
+
+      while true; do
+        register_self "$public_ip" "$public_key" "$tunnel_ip"
+
+        local peers
+        peers=$(discover_peers)
+
+        generate_config "$tunnel_ip" "$peers"
+        apply_config "$tunnel_ip"
+
+        sleep "$REFRESH_INTERVAL"
+      done
+    }
+
+    main
