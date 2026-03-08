@@ -16,19 +16,20 @@ spec:
       hostNetwork: true
       initContainers:
         - name: build-tools
-          image: golang:1.22-alpine
+          image: golang:1.24-alpine
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -e
-              apk add --no-cache git make gcc musl-dev linux-headers openssl-dev tar curl >/dev/null 2>&1
+              apk add --no-cache git make gcc g++ musl-dev linux-headers openssl-dev tar curl
 
               # Build wireguard-go
               cd /tmp
-              git clone --depth 1 https://github.com/WireGuard/wireguard-go.git 2>/dev/null
+              git clone --depth 1 https://github.com/WireGuard/wireguard-go.git 2>&1 | tail -1
               cd wireguard-go
               make >/dev/null 2>&1
               cp wireguard-go /shared/wireguard-go
+              echo "wireguard-go built OK"
 
               # Build redis-cli with TLS support (Alpine's package lacks TLS)
               cd /tmp
@@ -36,6 +37,7 @@ spec:
               cd redis-stable
               make BUILD_TLS=yes MALLOC=libc redis-cli >/dev/null 2>&1
               cp src/redis-cli /shared/redis-cli
+              echo "redis-cli built OK"
           volumeMounts:
             - name: shared-bin
               mountPath: /shared
