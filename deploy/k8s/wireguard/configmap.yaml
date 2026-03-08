@@ -19,6 +19,11 @@ data:
     HOSTNAME="$(hostname)"
     REFRESH_INTERVAL=30
 
+    # Generate a per-node key (the shared secret key is only used for Valkey auth)
+    # Each node needs a unique WireGuard keypair for the mesh to work
+    WG_PRIVATE_KEY=$(wg genkey)
+    export WG_PRIVATE_KEY
+
     get_public_ip() {
       local ip
       ip=$(curl -s --max-time 5 https://ifconfig.me || curl -s --max-time 5 https://api.ipify.org || true)
@@ -46,12 +51,24 @@ data:
       redis-cli -u "$VALKEY_URL" "$@"
     }
 
+    format_endpoint() {
+      local ip="$1"
+      local port="$2"
+      if [[ "$ip" == *:* ]]; then
+        echo "[${ip}]:${port}"
+      else
+        echo "${ip}:${port}"
+      fi
+    }
+
     register_self() {
       local public_ip="$1"
       local public_key="$2"
       local tunnel_ip="$3"
+      local endpoint
+      endpoint=$(format_endpoint "$public_ip" "$WG_PORT")
       local key="wg:peers:${WG_REGION}:${HOSTNAME}"
-      local payload="{\"public_key\":\"${public_key}\",\"endpoint\":\"${public_ip}:${WG_PORT}\",\"allowed_ips\":\"${tunnel_ip}/32\",\"region\":\"${WG_REGION}\",\"hostname\":\"${HOSTNAME}\"}"
+      local payload="{\"public_key\":\"${public_key}\",\"endpoint\":\"${endpoint}\",\"allowed_ips\":\"${tunnel_ip}/32\",\"region\":\"${WG_REGION}\",\"hostname\":\"${HOSTNAME}\"}"
       valkey_cmd SET "$key" "$payload" EX 120 >/dev/null
     }
 
@@ -102,7 +119,7 @@ data:
       local tunnel_ip="$1"
 
       if wg show "$WG_INTERFACE" >/dev/null 2>&1; then
-        wg syncconf "$WG_INTERFACE" <(grep -v "^\[Interface\]" "$WG_CONF" | grep -v "^PrivateKey" | grep -v "^ListenPort" | grep -v "^$")
+        wg syncconf "$WG_INTERFACE" "$WG_CONF"
         echo "$(date -Iseconds) synced config for ${WG_INTERFACE}"
       else
         ip link del "$WG_INTERFACE" 2>/dev/null || true
